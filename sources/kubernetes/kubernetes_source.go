@@ -15,6 +15,7 @@
 package kubernetes
 
 import (
+	"fmt"
 	"net/url"
 	"time"
 
@@ -27,6 +28,8 @@ import (
 	kubewatch "k8s.io/apimachinery/pkg/watch"
 
 	kubev1core "k8s.io/client-go/kubernetes/typed/core/v1"
+
+	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/klog"
 )
 
@@ -74,6 +77,8 @@ type KubernetesEventSource struct {
 	stopChannel chan struct{}
 
 	eventClient kubev1core.EventInterface
+
+	kubeClient k8s.Interface
 }
 
 func (this *KubernetesEventSource) GetNewEvents() *core.EventBatch {
@@ -100,6 +105,91 @@ event_loop:
 	totalEventsNum.Add(float64(len(result.Events)))
 
 	return &result
+}
+
+
+func isUnhealthyPodEvent(event *kubeapi.Event) bool {
+	// InvolvedObject.kind: Pod
+	// InvolvedObject.namespace: production
+	// InvolvedObject.name: rancher-756788df47-mf2s7
+	// Reason: Unhealthy
+	if event == nil {
+		return false
+	}
+	obj := event.InvolvedObject
+	return obj.Kind == "Pod" && event.Reason == "Unhealthy"
+}
+
+func (this *KubernetesEventSource) isUnhealthyPodEventCanBeIgnored(event *kubeapi.Event) bool {
+	obj := event.InvolvedObject
+	pod, err := this.kubeClient.CoreV1().Pods(obj.Namespace).Get(obj.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to get pod. ns=%s, name=%s, err=%v", obj.Namespace, obj.Name, err)
+		return false
+	}
+	//   ownerReferences:
+	//  - apiVersion: apps/v1
+	//    blockOwnerDeletion: true
+	//    controller: true
+	//    kind: ReplicaSet
+	//    name: cms-7d947cbbc7
+	//    uid: c4d0d544-4e9a-4408-abb0-3adcb41d45c7
+	replicaSetName := pod.OwnerReferences[0].Name
+	replicaSet, err := this.kubeClient.AppsV1().ReplicaSets(obj.Namespace).Get(replicaSetName, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to get ReplicaSets. ns=%s, name=%s, err=%v", obj.Namespace, replicaSetName, err)
+		return false
+	}
+
+	// 当前的：
+	//   ownerReferences:
+	//  - apiVersion: apps/v1
+	//    blockOwnerDeletion: true
+	//    controller: true
+	//    kind: Deployment
+	//    name: cms
+	//    uid: 74b5043f-ea4f-499f-acf0-3b86763fe499
+
+	// 老一点的：
+	//   ownerReferences:
+	//  - apiVersion: apps/v1
+	//    blockOwnerDeletion: true
+	//    controller: true
+	//    kind: Deployment
+	//    name: cms
+	//    uid: 74b5043f-ea4f-499f-acf0-3b86763fe499
+	//  resourceVersion: "196123578"
+	//  uid: 79b72c02-9880-442d-9e3b-ab93330823f8
+
+	deploymentName := replicaSet.OwnerReferences[0].Name
+	selector := fmt.Sprintf("app=%s", deploymentName)
+	replicaSetList, err := this.kubeClient.AppsV1().ReplicaSets(obj.Namespace).List(metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		klog.Errorf("Failed to get ReplicaSets List. ns=%s, labelSelector=%s, err=%v", obj.Namespace, selector, err)
+		return false
+	}
+
+	if replicaSetList == nil || len(replicaSetList.Items) == 0 {
+		klog.Errorf("replicaSetList == nil || len(replicaSetList.Items) == 0, ns=%s, labelSelector=%s", obj.Namespace, selector)
+		return false
+	}
+
+	// 看看是不是最新的
+	maxCreationTimestamp := replicaSetList.Items[0].CreationTimestamp.UnixNano()
+	for _, item := range replicaSetList.Items {
+		curTime := item.CreationTimestamp.UnixNano()
+		if curTime > maxCreationTimestamp {
+			maxCreationTimestamp = curTime
+		}
+	}
+
+	// 如果是最新的，说明最新的不健康，需要告警
+	if maxCreationTimestamp == replicaSet.CreationTimestamp.UnixNano() {
+		return false
+	}
+
+	// 说明非最新，不需要告警
+	return true
 }
 
 func (this *KubernetesEventSource) watch() {
@@ -146,6 +236,11 @@ func (this *KubernetesEventSource) watch() {
 				}
 
 				if event, ok := watchUpdate.Object.(*kubeapi.Event); ok {
+					if isUnhealthyPodEvent(event) && this.isUnhealthyPodEventCanBeIgnored(event){
+						// 可以忽略，通过修改字段来标记
+						event.Reason = "UnhealthyButCanbeIgnored"
+					}
+
 					switch watchUpdate.Type {
 					case kubewatch.Added, kubewatch.Modified:
 						select {
@@ -183,6 +278,7 @@ func NewKubernetesSource(uri *url.URL) (*KubernetesEventSource, error) {
 		localEventsBuffer: make(chan *kubeapi.Event, LocalEventsBufferSize),
 		stopChannel:       make(chan struct{}),
 		eventClient:       eventClient,
+		kubeClient:        kubeClient,
 	}
 	go result.watch()
 	return &result, nil
